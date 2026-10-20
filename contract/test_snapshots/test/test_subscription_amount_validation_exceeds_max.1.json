@@ -500,7 +500,7 @@
             },
             "ext": "v0"
           },
-          4095
+          6307200
         ]
       ],
       [
@@ -728,6 +728,18 @@
                         },
                         "val": {
                           "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "SchemaVersion"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 3
                         }
                       },
                       {

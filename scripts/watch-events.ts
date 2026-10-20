@@ -293,7 +293,7 @@ async function fetchAndPrintEvents(): Promise<void> {
       });
       totalEventsSeen = 0;
     }
-    
+
     // Sort by timestamp and print new events
     newEvents.sort((a, b) => a.timestamp - b.timestamp);
     for (const event of newEvents) {

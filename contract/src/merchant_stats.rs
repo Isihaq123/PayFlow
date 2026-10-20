@@ -1,6 +1,13 @@
 use soroban_sdk::{Address, Env, Vec};
 
+use crate::caps::{
+    MAX_MERCHANT_SUB_COUNT_BATCH, REVENUE_DAY_PAGE_SIZE, TOP_MERCHANTS_PAGE_SIZE,
+};
 use crate::DataKey;
+
+/// Maximum number of day-index entries retained per merchant after a prune or reset.
+/// Entries beyond this cap are dropped from the oldest end so the index stays bounded.
+pub const MAX_RETAINED_REVENUE_DAYS: u32 = 90;
 
 /// Returns the total revenue accumulated for a merchant.
 pub fn get_merchant_revenue(env: &Env, merchant: &Address) -> i128 {
@@ -143,6 +150,32 @@ pub fn get_merchant_index_size(env: &Env) -> u32 {
         .unwrap_or(0u32)
 }
 
+/// Returns a bounded page of merchants in index order. Missing slots are
+/// skipped, and `offset` is an index slot rather than a result count.
+pub fn get_merchant_page(env: &Env, offset: u32, limit: u32) -> Vec<Address> {
+    let size = get_merchant_index_size(env) as u64;
+    let cap = crate::caps::effective_page_size(Some(limit), crate::caps::MERCHANT_PAGE_SIZE);
+    let mut result = Vec::new(env);
+    let start = offset as u64;
+    if start >= size || cap == 0 {
+        return result;
+    }
+
+    let end = (start + cap as u64).min(size);
+    let mut slot = start;
+    while slot < end {
+        if let Some(merchant) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::MerchantIndex(slot as u32))
+        {
+            result.push_back(merchant);
+        }
+        slot += 1;
+    }
+    result
+}
+
 /// Indexes a merchant if not already indexed.
 pub fn index_merchant(env: &Env, merchant: &Address) {
     let known_key = DataKey::MerchantKnown(merchant.clone());
@@ -167,10 +200,62 @@ pub fn index_merchant(env: &Env, merchant: &Address) {
     }
 }
 
+/// Removes a merchant from the merchant index using swap-remove.
+///
+/// The last occupied slot is moved into the vacated position and the index size
+/// is decremented, mirroring the `WhitelistIndex` compaction in
+/// `whitelist::remove_merchant`. This keeps the index dense (no tombstoned
+/// holes) so `get_top_merchants_by_subs` stops ranking a removed merchant and
+/// its scan cost shrinks by one slot.
+///
+/// The `MerchantKnown` marker is cleared so a later `index_merchant` (on re-add
+/// or a new subscription) appends a fresh slot instead of treating the removed
+/// merchant as already indexed.
+///
+/// Idempotent: removing a merchant that is not indexed is a no-op.
+pub fn unindex_merchant(env: &Env, merchant: &Address) {
+    let size = get_merchant_index_size(env);
+    if size > 0 {
+        for i in 0..size {
+            let key = DataKey::MerchantIndex(i);
+            if let Some(addr) = env.storage().persistent().get::<_, Address>(&key) {
+                if addr == *merchant {
+                    let last_idx = size - 1;
+                    if i != last_idx {
+                        let last_key = DataKey::MerchantIndex(last_idx);
+                        if let Some(last_addr) =
+                            env.storage().persistent().get::<_, Address>(&last_key)
+                        {
+                            env.storage().persistent().set(&key, &last_addr);
+                            env.storage()
+                                .persistent()
+                                .extend_ttl(&key, 1555200, 1555200);
+                        }
+                    }
+                    env.storage()
+                        .persistent()
+                        .remove(&DataKey::MerchantIndex(last_idx));
+
+                    let size_key = DataKey::MerchantIndexSize;
+                    env.storage().persistent().set(&size_key, &(size - 1));
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&size_key, 1555200, 1555200);
+                    break;
+                }
+            }
+        }
+    }
+
+    env.storage()
+        .persistent()
+        .remove(&DataKey::MerchantKnown(merchant.clone()));
+}
+
 /// Returns top N merchants ranked by active subscriber count in descending order.
 /// `limit` is capped at 20; panics with `BatchTooLarge` if exceeded.
 pub fn get_top_merchants_by_subs(env: &Env, limit: u32) -> Vec<(Address, u32)> {
-    if limit > 20 {
+    if limit > TOP_MERCHANTS_PAGE_SIZE {
         env.panic_with_error(crate::errors::ContractError::BatchTooLarge);
     }
     if limit == 0 {
@@ -240,7 +325,31 @@ pub fn decrement_subscriber_count(env: &Env, merchant: &Address) {
     }
 }
 
-/// Resets a merchant's cumulative revenue counter to zero.
+/// Resets a merchant's revenue accounting to a fully cleared state.
+///
+/// # Reset semantics (Issue #1215)
+///
+/// `reset_merchant_revenue` is a *full* clear. It zeroes the cumulative total,
+/// removes every per-day bucket referenced by the day-index, empties the
+/// day-index, and drops the consolidated `MerchantRevenueHistory`. This is the
+/// same "removed" notion `prune_merchant_revenue_days` applies per day (index
+/// entry and bucket go together), extended to the whole merchant, so no revenue
+/// reader can observe pre-reset data afterwards:
+///
+/// - `get_merchant_revenue` -> 0
+/// - `get_merchant_revenue_summary` -> `(0, 0, 0, 0)`
+/// - `get_merchant_revenue_day` -> 0 for every day
+/// - `get_merchant_revenue_day_page` -> empty
+/// - `get_merchant_revenue_history` -> empty
+///
+/// `prune_merchant_revenue_days` stays intentionally partial: it removes only
+/// the requested day buckets and their index slots while retaining the
+/// per-charge history timeline, which carries no day association to prune.
+/// Documenting the two together is the point of the choice here — a reset is
+/// all-or-nothing, a prune is surgical.
+///
+/// The `PendingMerchantRevCount` counter is decremented when the merchant had a
+/// non-zero total, matching the increment done in `increment_revenue`.
 pub fn reset_merchant_revenue(env: &Env, merchant: &Address) {
     let current = get_merchant_revenue(env, merchant);
     if current > 0 {
@@ -251,6 +360,31 @@ pub fn reset_merchant_revenue(env: &Env, merchant: &Address) {
     env.storage()
         .persistent()
         .extend_ttl(&key, 1555200, 1555200);
+
+    // Drop every per-day bucket referenced by the day-index before emptying it,
+    // so a single-day read cannot return pre-reset data.
+    let index_key = DataKey::MerchantRevenueDayIndex(merchant.clone());
+    let index: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&index_key)
+        .unwrap_or_else(|| Vec::new(env));
+    for day in index.iter() {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::MerchantRevenueDay(merchant.clone(), day));
+    }
+
+    // Empty the day-index so repeated reset cycles don't grow it unboundedly.
+    let empty: Vec<u64> = Vec::new(env);
+    env.storage().persistent().set(&index_key, &empty);
+    env.storage()
+        .persistent()
+        .extend_ttl(&index_key, 1555200, 1555200);
+
+    // Clear the consolidated history so summary readers (count/min/max) report
+    // the same cleared state as the cumulative total.
+    clear_revenue_history(env, merchant);
 }
 
 /// Extends the TTL of a specific merchant daily revenue bucket.
@@ -264,12 +398,60 @@ pub fn bump_merchant_revenue_day(env: &Env, merchant: &Address, day: u64) {
 }
 
 /// Prunes missing or expired daily revenue buckets safely.
+/// Removes each requested day's storage entry and compacts the day-index so
+/// stale slots are never returned by readers. Retains at most
+/// `MAX_RETAINED_REVENUE_DAYS` entries (newest) after compaction.
 pub fn prune_merchant_revenue_days(env: &Env, merchant: &Address, days: Vec<u64>) {
     crate::admin::require_admin(env);
+
+    // Build a set of days being removed for O(n) index walk.
+    // Soroban has no HashSet in no_std, so we collect into a Vec and scan.
+    let mut removed_set: Vec<u64> = Vec::new(env);
     for day in days.into_iter() {
         let key = DataKey::MerchantRevenueDay(merchant.clone(), day);
         env.storage().persistent().remove(&key);
+        removed_set.push_back(day);
     }
+
+    // Compact the day-index: keep entries whose day is not in removed_set.
+    let index_key = DataKey::MerchantRevenueDayIndex(merchant.clone());
+    let index: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&index_key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    let mut compacted: Vec<u64> = Vec::new(env);
+    for day in index.iter() {
+        let mut pruned = false;
+        for r in removed_set.iter() {
+            if day == r {
+                pruned = true;
+                break;
+            }
+        }
+        if !pruned {
+            compacted.push_back(day);
+        }
+    }
+
+    // Enforce the retention cap: keep only the newest MAX_RETAINED_REVENUE_DAYS entries.
+    let cap = MAX_RETAINED_REVENUE_DAYS;
+    let final_index = if compacted.len() > cap {
+        let start = compacted.len() - cap;
+        let mut capped: Vec<u64> = Vec::new(env);
+        for i in start..compacted.len() {
+            capped.push_back(compacted.get(i).unwrap());
+        }
+        capped
+    } else {
+        compacted
+    };
+
+    env.storage().persistent().set(&index_key, &final_index);
+    env.storage()
+        .persistent()
+        .extend_ttl(&index_key, 1555200, 1555200);
 }
 
 /// Retrieves a specific daily revenue bucket.
@@ -277,8 +459,6 @@ pub fn get_merchant_revenue_day(env: &Env, merchant: &Address, day: u64) -> i128
     let key = DataKey::MerchantRevenueDay(merchant.clone(), day);
     env.storage().persistent().get(&key).unwrap_or(0i128)
 }
-
-const MAX_MERCHANT_SUB_COUNT_BATCH: u32 = 50;
 
 /// Returns active subscriber counts for multiple merchants in a single call.
 /// Capped at 50 merchants; panics with `BatchTooLarge` above that.
@@ -290,7 +470,7 @@ pub fn get_merchant_sub_counts(env: &Env, merchants: &Vec<Address>) -> Vec<(Addr
 
     let mut result = Vec::new(env);
     for merchant in merchants.iter() {
-        let count = crate::subscription_count::get_merchant_sub_count(env, &merchant);
+        let count = get_merchant_subscriber_count(env, &merchant);
         result.push_back((merchant, count));
     }
     result
@@ -335,7 +515,7 @@ pub fn get_merchant_revenue_day_page(
     offset: u32,
     limit: u32,
 ) -> Vec<(u64, i128)> {
-    if limit > 30 {
+    if limit > REVENUE_DAY_PAGE_SIZE {
         env.panic_with_error(crate::errors::ContractError::BatchTooLarge);
     }
 

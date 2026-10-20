@@ -563,7 +563,7 @@
             },
             "ext": "v0"
           },
-          4095
+          6307200
         ]
       ],
       [
@@ -1737,7 +1737,7 @@
               }
             ],
             "data": {
-              "u32": 1
+              "u64": 1
             }
           }
         }
@@ -1865,7 +1865,7 @@
               }
             ],
             "data": {
-              "u32": 0
+              "u64": 0
             }
           }
         }
@@ -1892,38 +1892,6 @@
             ],
             "data": {
               "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000003",
-        "type_": "contract",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "cancelled"
-              },
-              {
-                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-              }
-            ],
-            "data": {
-              "map": [
-                {
-                  "key": {
-                    "symbol": "ledger_sequence"
-                  },
-                  "val": {
-                    "u32": 0
-                  }
-                }
-              ]
             }
           }
         }
@@ -1993,7 +1961,7 @@
               }
             ],
             "data": {
-              "u32": 0
+              "u64": 0
             }
           }
         }

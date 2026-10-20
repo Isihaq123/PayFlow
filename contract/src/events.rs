@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, BytesN, Env, Symbol};
+use soroban_sdk::{Address, BytesN, Env, String, Symbol};
 
 use crate::Subscription;
 
@@ -20,6 +20,7 @@ pub struct ChargeEventData {
     pub net: i128,
     pub charged_at: u64,
     pub ledger_sequence: u32,
+    pub paid_to: Option<Address>,
 }
 
 #[soroban_sdk::contracttype]
@@ -55,14 +56,53 @@ pub fn publish_subscribed(env: &Env, user: &Address, sub: &Subscription) {
     );
 }
 
+/// Publishes `cancelled(user)` after a subscription is cancelled.
+pub fn publish_cancelled(env: &Env, user: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "cancelled"), user.clone()),
+        CancelledEventData {
+            ledger_sequence: env.ledger().sequence(),
+        },
+    );
+}
+
+/// Publishes `cancelled_with_refund(user, refund)` after a prorated refund
+/// cancels the subscription. `refund` is the amount transferred back to the
+/// subscriber, in the subscription's token.
+pub fn publish_cancelled_with_refund(env: &Env, user: &Address, refund: i128) {
+    env.events().publish(
+        (Symbol::new(env, "cancelled_with_refund"), user.clone()),
+        CancelledWithRefundEventData {
+            refund_amount: refund,
+            ledger_sequence: env.ledger().sequence(),
+        },
+    );
+}
+
+/// Publishes `pay_per_use(user)` for an instant micro-transfer to `merchant`.
+/// The recipient is carried in the payload as `merchant` so indexers keying on
+/// `(event, user)` still see every payment the subscriber made.
+pub fn publish_pay_per_use(env: &Env, user: &Address, merchant: &Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "pay_per_use"), user.clone()),
+        PayPerUseEventData {
+            merchant: merchant.clone(),
+            amount,
+            ledger_sequence: env.ledger().sequence(),
+        },
+    );
+}
+
+/// Publishes the same checked net amount used for the merchant transfer and revenue.
 pub fn publish_charged(
     env: &Env,
     user: &Address,
     sub: &Subscription,
     fee_amount: i128,
+    net: i128,
     charged_at: u64,
+    paid_to: Option<Address>,
 ) {
-    let net = sub.amount - fee_amount;
     env.events().publish(
         (Symbol::new(env, "charged"), user.clone()),
         ChargeEventData {
@@ -72,6 +112,7 @@ pub fn publish_charged(
             net,
             charged_at,
             ledger_sequence: env.ledger().sequence(),
+            paid_to,
         },
     );
 }
@@ -120,7 +161,7 @@ pub fn publish_admin_transfer_proposed(env: &Env, new_admin: &Address) {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetadataSetEventData {
     pub user: Address,
-    pub label: BytesN<64>,
+    pub label: String,
     pub ledger_sequence: u32,
 }
 
@@ -134,7 +175,7 @@ pub struct MetadataClearedEventData {
 }
 
 /// Publishes `metadata_set(user)` with the written label.
-pub fn publish_metadata_set(env: &Env, user: &Address, label: &BytesN<64>) {
+pub fn publish_metadata_set(env: &Env, user: &Address, label: &String) {
     env.events().publish(
         (Symbol::new(env, "metadata_set"), user.clone()),
         MetadataSetEventData {
@@ -316,6 +357,10 @@ pub fn publish_max_batch_size_set(env: &Env, old: u32, new: u32) {
         MaxBatchSizeSetEventData { old, new },
     );
 }
+pub fn publish_max_whitelist_batch_size_set(env: &Env, old: u32, new: u32) {
+    env.events()
+        .publish((Symbol::new(env, "max_wl_batch_size_set"),), (old, new));
+}
 
 pub fn publish_merchant_history_cleared(env: &Env, merchant: &Address) {
     env.events()
@@ -361,7 +406,12 @@ pub fn publish_subscription_transferred(env: &Env, old_user: &Address, new_user:
     );
 }
 
-pub fn emit_subscription_transferred(env: &Env, from: &Address, to: &Address, sub: &Subscription) {
+pub fn publish_subscription_transferred_detailed(
+    env: &Env,
+    from: &Address,
+    to: &Address,
+    sub: &Subscription,
+) {
     env.events().publish(
         (
             Symbol::new(env, "subscription_transferred"),
@@ -561,9 +611,9 @@ pub fn publish_whitelist_enabled(env: &Env, enabled: bool) {
         .publish((Symbol::new(env, "whitelist_enabled"),), enabled);
 }
 
-pub fn publish_max_whitelist_batch_size_set(env: &Env, old: u32, new: u32) {
-    env.events()
-        .publish((Symbol::new(env, "max_wl_batch_size_set"),), (old, new));
+pub fn publish_merchant_withdrawal(env: &Env, merchant: &Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "merchant_withdrawal"), merchant.clone()),
+        amount,
+    );
 }
-
-

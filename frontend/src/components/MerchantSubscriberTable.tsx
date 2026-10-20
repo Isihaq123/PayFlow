@@ -10,9 +10,11 @@
  *
  * Issue #660
  */
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import type { MerchantSubscriber } from "../stellar";
 import { formatAddress, formatXlm } from "../utils/format";
+import { debounce } from "../utils/debounce";
+import { SECONDS_PER_DAY, SECONDS_PER_WEEK, SECONDS_PER_MONTH } from "../constants";
 import CopyButton from "./CopyButton";
 import { useVirtualList } from "../hooks/useVirtualList";
 
@@ -30,8 +32,9 @@ export interface SortState {
   dir: SortDir;
 }
 
-interface Props {
+export interface MerchantSubscriberTableProps {
   subscribers: MerchantSubscriber[];
+  debounceMs?: number;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -44,13 +47,14 @@ function formatDate(unixSec: number): string {
   });
 }
 
-function formatInterval(secs: number): string {
-  const day = 86_400;
-  const week = 604_800;
-  const month = 2_592_000;
-  if (secs >= month) return `${Math.round(secs / month)}mo`;
-  if (secs >= week) return `${Math.round(secs / week)}w`;
-  if (secs >= day) return `${Math.round(secs / day)}d`;
+/**
+ * Human-readable interval label. Buckets are derived from the shared
+ * SECONDS_PER_* constants so the table stays in sync with BILLING_INTERVALS.
+ */
+export function formatInterval(secs: number): string {
+  if (secs >= SECONDS_PER_MONTH) return `${Math.round(secs / SECONDS_PER_MONTH)}mo`;
+  if (secs >= SECONDS_PER_WEEK) return `${Math.round(secs / SECONDS_PER_WEEK)}w`;
+  if (secs >= SECONDS_PER_DAY) return `${Math.round(secs / SECONDS_PER_DAY)}d`;
   return `${secs}s`;
 }
 
@@ -78,15 +82,52 @@ function SortIcon({ field, sort }: { field: SortField; sort: SortState }) {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export default function MerchantSubscriberTable({ subscribers }: Props) {
+export default function MerchantSubscriberTable({
+  subscribers,
+  debounceMs = 150,
+}: MerchantSubscriberTableProps) {
   const [sort, setSort] = useState<SortState>({ field: "nextCharge", dir: "asc" });
   const [filter, setFilter] = useState<StatusFilter>("all");
+  const [appliedFilter, setAppliedFilter] = useState<StatusFilter>("all");
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+
+  // Debounced filter setter so a burst of filter changes produces a single settled render
+  const debouncedSetAppliedFilter = useMemo(
+    () =>
+      debounce((nextFilter: StatusFilter) => {
+        setAppliedFilter(nextFilter);
+      }, debounceMs),
+    [debounceMs]
+  );
+
+  useEffect(() => {
+    return () => {
+      debouncedSetAppliedFilter.cancel();
+    };
+  }, [debouncedSetAppliedFilter]);
+
+  const handleFilterClick = (nextFilter: StatusFilter) => {
+    setFilter(nextFilter);
+    if (debounceMs <= 0) {
+      debouncedSetAppliedFilter.cancel();
+      setAppliedFilter(nextFilter);
+    } else {
+      debouncedSetAppliedFilter(nextFilter);
+    }
+  };
+
+  // Reset scrollTop of the scroll container whenever items, sort, or filter changes
+  useEffect(() => {
+    if (scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTop = 0;
+    }
+  }, [subscribers, sort, appliedFilter]);
 
   // ── Filter ────────────────────────────────────────────────────────────────
   const filtered = useMemo(() => {
-    if (filter === "all") return subscribers;
-    return subscribers.filter((s) => deriveStatus(s.nextChargeAt) === filter);
-  }, [subscribers, filter]);
+    if (appliedFilter === "all") return subscribers;
+    return subscribers.filter((s) => deriveStatus(s.nextChargeAt) === appliedFilter);
+  }, [subscribers, appliedFilter]);
 
   // ── Sort ──────────────────────────────────────────────────────────────────
   const sorted = useMemo(() => {
@@ -166,7 +207,7 @@ export default function MerchantSubscriberTable({ subscribers }: Props) {
             <button
               key={f}
               className={`mst-filter-btn${filter === f ? " mst-filter-btn--active" : ""}`}
-              onClick={() => setFilter(f)}
+              onClick={() => handleFilterClick(f)}
               aria-pressed={filter === f}
               aria-label={`Show ${label} subscribers`}
             >
@@ -187,6 +228,7 @@ export default function MerchantSubscriberTable({ subscribers }: Props) {
       {sorted.length > 0 && (
         <div
           className="mst-scroll-container"
+          ref={scrollContainerRef}
           onScroll={onScroll}
           style={{ maxHeight: CONTAINER_HEIGHT, overflowY: "auto" }}
         >

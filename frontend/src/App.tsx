@@ -1,7 +1,9 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useContext, useEffect, useRef, useState } from "react";
 import { useWallet, AVAILABLE_WALLETS } from "./hooks/useWallet";
 import { useAccessibility } from "./hooks/useAccessibility";
 import { useRpcHealthContext } from "./context/RpcHealthContext";
+import { ToastProvider } from "./context/ToastContext";
+import { useToast } from "./hooks/useToast";
 import SubscribeForm from "./components/SubscribeForm";
 import Dashboard from "./components/Dashboard";
 import RpcSettings from "./components/RpcSettings";
@@ -9,7 +11,6 @@ import { useNetworkStatus } from "./hooks/useNetworkStatus";
 import { useAdmin } from "./hooks/useAdmin";
 import { useContractId } from "./hooks/useContractId";
 import { useContractPaused } from "./hooks/useContractPaused";
-import { useToast } from "./hooks/useToast";
 import MerchantDashboard from "./components/MerchantDashboard";
 import WalletSelectModal from "./components/WalletSelectModal";
 import WalletBar from "./components/WalletBar";
@@ -19,17 +20,22 @@ import ContractPauseBanner from "./components/ContractPauseBanner";
 import NetworkBadge from "./components/NetworkBadge";
 import AdminDashboard from "./pages/AdminDashboard";
 import type { WalletAdapter } from "./services/wallets/WalletAdapter";
+import ConnectWallet from "./components/ConnectWallet";
+import ShortcutHelpOverlay from "./components/ShortcutHelpOverlay";
+import { ShortcutRegistryContext } from "./context/ShortcutRegistry";
 
 type Tab = "dashboard" | "subscribe" | "merchant" | "admin";
 
-export default function App() {
-  const { publicKey, connect, disconnect, signAndSubmit, error, connecting, activeAdapter } =
+function AppInner() {
+  const { publicKey, connect, disconnect, signAndSubmit, error, connecting, connectionStatus, activeAdapter } =
     useWallet();
   const { announcement, announce } = useAccessibility();
   const { healthy, circuitOpen } = useRpcHealthContext();
   const [tab, setTab] = useState<Tab>("dashboard");
   const [refresh, setRefresh] = useState(0);
   const [showRpcSettings, setShowRpcSettings] = useState(false);
+  const [showShortcutHelp, setShowShortcutHelp] = useState(false);
+  const shortcutRegistry = useContext(ShortcutRegistryContext);
 
   const isRpcFailing = !healthy || circuitOpen;
   const {
@@ -42,15 +48,11 @@ export default function App() {
   } = useNetworkStatus();
   const { valid: isContractIdValid, error: contractIdError } = useContractId();
   const { isAdmin } = useAdmin(publicKey);
-  const { isPaused } = useContractPaused();
-  // Dashboard/SubscribeForm/MerchantDashboard/admin panels each keep their own
-  // useToast() instance (and their own tests mock them independently), so
-  // centralizing every toast call site into one shared instance is out of
-  // scope here. This App-level instance exists solely to drive the header's
-  // NotificationCenter (issue #864).
+  const { isPaused, status: contractStatus } = useContractPaused();
   const { notifications, unreadCount, markAllRead, clearNotifications } = useToast();
   const [showWalletModal, setShowWalletModal] = useState(false);
   const wasOnline = useRef(isOnline);
+  const closeShortcutHelp = useCallback(() => setShowShortcutHelp(false), []);
 
   // Announce connectivity changes via the ARIA live region (issue: disable
   // mutating CTAs while offline + announce status).
@@ -96,7 +98,7 @@ export default function App() {
     <div style={{ maxWidth: 480, margin: "60px auto", padding: "0 16px" }}>
       {/* Contract pause banner — rendered first so it takes precedence over
           everything else, including toasts (see index.css stacking rules). */}
-      <ContractPauseBanner paused={isPaused} />
+      <ContractPauseBanner paused={isPaused} contractStatus={contractStatus} />
 
       {/* ARIA live region for screen reader announcements */}
       <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
@@ -191,23 +193,11 @@ export default function App() {
 
       {/* Wallet connect */}
       {!publicKey ? (
-        <div className="card" style={{ textAlign: "center" }}>
-          <p style={{ color: "#94a3b8", marginBottom: 16, fontSize: 14 }}>
-            Connect a wallet to get started.
-          </p>
-          <button
-            onClick={() => setShowWalletModal(true)}
-            disabled={connecting}
-            style={{ background: "#7c3aed", color: "#fff" }}
-          >
-            {connecting ? "Connecting…" : "Connect Wallet"}
-          </button>
-          {error && (
-            <p role="alert" style={{ color: "var(--color-danger)", marginTop: 12, fontSize: 13 }}>
-              {error}
-            </p>
-          )}
-        </div>
+        <ConnectWallet
+          onConnect={() => setShowWalletModal(true)}
+          error={error}
+          loading={connecting}
+        />
       ) : (
         <>
           {/* Connected bar — shows adapter name/icon, address, disconnect */}
@@ -222,47 +212,90 @@ export default function App() {
           />
 
           {/* Tab navigation — admin tab only visible to contract admin */}
-          <TabBar tabs={visibleTabs} activeTab={tab} onTabChange={setTab} />
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <TabBar tabs={visibleTabs} activeTab={tab} onTabChange={setTab} />
+            </div>
+            <button
+              type="button"
+              className="btn-secondary"
+              aria-label="Show keyboard shortcuts"
+              title="Keyboard shortcuts"
+              onClick={() => setShowShortcutHelp(true)}
+            >
+              ?
+            </button>
+          </div>
 
           {/* Content */}
           <div className="card" style={{ marginTop: 20 }}>
-            {tab === "subscribe" && (
-              <SubscribeForm
-                userKey={publicKey}
-                onSign={signAndSubmit}
-                onSuccess={() => {
-                  setTab("dashboard");
-                  setRefresh((r) => r + 1);
-                }}
-                isPaused={!gatePassed}
-                announce={announce}
-                isOffline={!isOnline}
-              />
-            )}
-            {tab === "dashboard" && (
-              <Dashboard
-                userKey={publicKey}
-                onSign={signAndSubmit}
-                refreshTrigger={refresh}
-                announce={announce}
-                isPaused={!gatePassed}
-                isOffline={!isOnline}
-              />
-            )}
-            {tab === "merchant" && (
-              <MerchantDashboard
-                merchantKey={publicKey}
-                onSign={signAndSubmit}
-                refreshTrigger={refresh}
-                isPaused={isPaused}
-              />
-            )}
-            {tab === "admin" && isAdmin && (
-              <AdminDashboard
-                publicKey={publicKey}
-                onSign={signAndSubmit}
-                gatePassed={gatePassed}
-              />
+            <div
+              role="tabpanel"
+              id="panel-subscribe"
+              aria-labelledby="tab-subscribe"
+              hidden={tab !== "subscribe"}
+            >
+              {tab === "subscribe" && (
+                <SubscribeForm
+                  userKey={publicKey}
+                  onSign={signAndSubmit}
+                  onSuccess={() => {
+                    setTab("dashboard");
+                    setRefresh((r) => r + 1);
+                  }}
+                  isPaused={!gatePassed}
+                  announce={announce}
+                  isOffline={!isOnline}
+                />
+              )}
+            </div>
+            <div
+              role="tabpanel"
+              id="panel-dashboard"
+              aria-labelledby="tab-dashboard"
+              hidden={tab !== "dashboard"}
+            >
+              {tab === "dashboard" && (
+                <Dashboard
+                  userKey={publicKey}
+                  onSign={signAndSubmit}
+                  refreshTrigger={refresh}
+                  announce={announce}
+                  isPaused={!gatePassed}
+                  isOffline={!isOnline}
+                />
+              )}
+            </div>
+            <div
+              role="tabpanel"
+              id="panel-merchant"
+              aria-labelledby="tab-merchant"
+              hidden={tab !== "merchant"}
+            >
+              {tab === "merchant" && (
+                <MerchantDashboard
+                  merchantKey={publicKey}
+                  onSign={signAndSubmit}
+                  refreshTrigger={refresh}
+                  isPaused={isPaused}
+                />
+              )}
+            </div>
+            {isAdmin && (
+              <div
+                role="tabpanel"
+                id="panel-admin"
+                aria-labelledby="tab-admin"
+                hidden={tab !== "admin"}
+              >
+                {tab === "admin" && (
+                  <AdminDashboard
+                    publicKey={publicKey}
+                    onSign={signAndSubmit}
+                    gatePassed={gatePassed}
+                  />
+                )}
+              </div>
             )}
           </div>
         </>
@@ -274,8 +307,24 @@ export default function App() {
           adapters={AVAILABLE_WALLETS}
           onSelect={handleSelectWallet}
           onClose={() => setShowWalletModal(false)}
+          connectionStatus={connectionStatus}
+          error={error}
+        />
+      )}
+      {showShortcutHelp && (
+        <ShortcutHelpOverlay
+          shortcuts={shortcutRegistry?.shortcuts ?? []}
+          onClose={closeShortcutHelp}
         />
       )}
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ToastProvider>
+      <AppInner />
+    </ToastProvider>
   );
 }

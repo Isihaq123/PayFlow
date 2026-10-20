@@ -9,6 +9,17 @@ pub fn get_subscription(env: &Env, user: &Address) -> Option<Subscription> {
         .get(&DataKey::Subscription(user.clone()))
 }
 
+/// Overwrites the stored subscription entry for `user`.
+///
+/// Callers that mutate a subscription in place (e.g. trial extension) write the
+/// whole struct back through here so the storage key layout stays owned by this
+/// module.
+pub fn set_subscription(env: &Env, user: &Address, sub: &Subscription) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::Subscription(user.clone()), sub);
+}
+
 /// Extends the TTL of a subscription entry and, when present, its
 /// associated `PauseExpiry` key. Keeping both entries alive is
 /// critical: if PauseExpiry archives while the subscription survives,
@@ -32,6 +43,10 @@ pub fn extend_subscription_ttl(env: &Env, user: &Address) {
             SUBSCRIPTION_TTL_LEDGERS,
         );
     }
+}
+
+pub fn set_token(env: &Env, token: &Address) {
+    env.storage().instance().set(&DataKey::Token, token);
 }
 
 pub fn get_token(env: &Env) -> Option<Address> {
@@ -91,4 +106,33 @@ pub fn clear_pause_expiry(env: &Env, user: &Address) {
     env.storage()
         .persistent()
         .remove(&DataKey::PauseExpiry(user.clone()));
+}
+
+/// Resolves the paused-subscription `active`-flag semantics in one place.
+///
+/// A paused subscription — indefinite (`pause`) or bounded (`pause_until`) —
+/// keeps `active == true`; pausing never deactivates a subscription. Since
+/// issue #1009 the `paused && !active` combination is a **legacy** state only,
+/// written by older versions of `pause_until` before this rule was encoded.
+/// Cancellation (`cancel`, `batch_cancel`, `cancel_and_refund_prorated`) is
+/// the only writer of `active = false`.
+///
+/// Legacy `paused && !active` rows are excluded from active counts and active
+/// subscriber readers because their `active` flag is false. Raw append-only
+/// subscriber-index readers still return the recorded address; they enumerate
+/// slots rather than active subscriptions. `is_cancelled` preserves the
+/// separate cancellation distinction for mutation and charge flows:
+/// legacy paused rows are not considered cancelled by that helper.
+///
+/// - `subscription_count` — a paused subscription stays counted as active.
+/// - `get_active_subscriber_page` — current paused subscriptions with
+///   `active == true` stay listed; legacy inactive-paused rows do not.
+/// - `cancel_and_refund_prorated` — `active == false` means cancelled, not
+///   paused; the separate `paused` check is what blocks paused rows.
+/// - `batch auto-resume` (`try_auto_resume`) — cancels and paused rows are
+///   distinct outcomes; only a paused row with an elapsed expiry resumes.
+/// - `resume` — only cancelled rows are rejected; legacy `paused && !active`
+///   rows stay resumable.
+pub fn is_cancelled(sub: &Subscription) -> bool {
+    !sub.active && !sub.paused
 }

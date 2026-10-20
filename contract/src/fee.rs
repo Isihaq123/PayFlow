@@ -1,7 +1,7 @@
 use soroban_sdk::{token, Address, Env};
 
 use crate::validation;
-use crate::{errors::ContractError, DataKey, Subscription};
+use crate::{errors::ContractError, DataKey, Subscription, SUBSCRIPTION_TTL_LEDGERS};
 
 /// Retrieves the fee collector address from instance storage.
 pub fn get_fee_collector(env: &Env) -> Option<Address> {
@@ -15,22 +15,37 @@ pub fn get_fee_bps(env: &Env) -> u32 {
 }
 
 /// Stores a custom fee recipient address for a specific merchant.
+/// Immediately bumps the TTL to ~1 year so the entry survives long-running
+/// deployments without manual extension.
 pub fn set_merchant_fee_recipient(env: &Env, merchant: &Address, recipient: &Address) {
     merchant.require_auth();
     if recipient == &env.current_contract_address() {
         env.panic_with_error(ContractError::InvalidRecipient);
     }
-    env.storage()
-        .persistent()
-        .set(&DataKey::MerchantFeeRecipient(merchant.clone()), recipient);
+    let key = DataKey::MerchantFeeRecipient(merchant.clone());
+    env.storage().persistent().set(&key, recipient);
+    env.storage().persistent().extend_ttl(
+        &key,
+        SUBSCRIPTION_TTL_LEDGERS / 2,
+        SUBSCRIPTION_TTL_LEDGERS,
+    );
     crate::events::publish_merchant_fee_recipient_set(env, merchant, recipient);
 }
 
 /// Reads the custom fee recipient for a merchant if set.
+/// Re-bumps the TTL to ~1 year on every read so that an actively-used
+/// recipient cannot lapse during steady-state charging operations.
 pub fn get_merchant_fee_recipient(env: &Env, merchant: &Address) -> Option<Address> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::MerchantFeeRecipient(merchant.clone()))
+    let key = DataKey::MerchantFeeRecipient(merchant.clone());
+    let recipient: Option<Address> = env.storage().persistent().get(&key);
+    if recipient.is_some() {
+        env.storage().persistent().extend_ttl(
+            &key,
+            SUBSCRIPTION_TTL_LEDGERS / 2,
+            SUBSCRIPTION_TTL_LEDGERS,
+        );
+    }
+    recipient
 }
 
 /// Clears the custom fee recipient for a merchant if configured, emitting an event.
@@ -169,11 +184,16 @@ fn accumulate_protocol_fees(env: &Env, amount: i128) {
 // (error #8) that clients and alerting already map.
 
 /// Transfers subscription charge amounts (fee to collector/merchant fee recipient, net to merchant).
-/// Returns the fee amount deducted from the gross subscription amount.
+/// Returns `(fee_amount, net, paid_to)` so bookkeeping and events reuse the checked
+/// amounts transferred to the fee recipient and merchant along with the fee destination.
 ///
 /// Panics with `InsufficientAllowance` when the contract's allowance over
 /// `user`'s tokens is below the **gross** `sub.amount`, before any transfer runs.
-pub fn transfer_subscription_charge(env: &Env, user: &Address, sub: &Subscription) -> i128 {
+pub fn transfer_subscription_charge(
+    env: &Env,
+    user: &Address,
+    sub: &Subscription,
+) -> (i128, i128, Option<Address>) {
     // Preflight: one allowance check covering both legs (fee + net == gross).
     validation::check_allowance(env, user, &sub.token, sub.amount);
 
@@ -181,17 +201,19 @@ pub fn transfer_subscription_charge(env: &Env, user: &Address, sub: &Subscriptio
     let fee_collector = get_merchant_fee_recipient(env, &sub.merchant)
         .or_else(|| get_fee_collector(env));
 
-    let fee_amount = match fee_collector {
+    let (fee_amount, paid_to) = match fee_collector {
         Some(collector) if bps > 0 => {
             let fee = calculate_fee_amount(env, sub.amount, bps);
             if fee > 0 {
                 let token_client = token::Client::new(env, &sub.token);
                 token_client.transfer_from(&env.current_contract_address(), user, &collector, &fee);
                 accumulate_protocol_fees(env, fee);
+                (fee, Some(collector))
+            } else {
+                (0, None)
             }
-            fee
         }
-        _ => 0,
+        _ => (0, None),
     };
     let net = sub
         .amount
@@ -201,7 +223,7 @@ pub fn transfer_subscription_charge(env: &Env, user: &Address, sub: &Subscriptio
     let token_client = token::Client::new(env, &sub.token);
     token_client.transfer_from(&env.current_contract_address(), user, &sub.merchant, &net);
 
-    fee_amount
+    (fee_amount, net, paid_to)
 }
 
 /// Transfers a pay-per-use amount (fee to collector/merchant fee recipient, net to `recipient`).

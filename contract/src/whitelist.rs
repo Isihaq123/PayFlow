@@ -87,15 +87,19 @@ pub fn add_merchant(env: &Env, merchant: &Address) {
         .persistent()
         .extend_ttl(&index_key, 1555200, 1555200);
 
+    // Write reverse index so remove_merchant can look up the slot in O(1).
+    let slot_key = DataKey::WhitelistIndexSlot(merchant.clone());
+    env.storage().persistent().set(&slot_key, &size);
+    env.storage()
+        .persistent()
+        .extend_ttl(&slot_key, 1555200, 1555200);
+
     let size_key = DataKey::WhitelistIndexSize;
     env.storage().persistent().set(&size_key, &(size + 1));
     env.storage()
         .persistent()
         .extend_ttl(&size_key, 1555200, 1555200);
 
-        env.storage()
-        .persistent()
-        .set(&DataKey::MerchantWhitelist(merchant.clone()), &true);
     merchant_stats::index_merchant(env, merchant);
     events::publish_merchant_added(env, merchant);
 }
@@ -111,35 +115,84 @@ pub fn remove_merchant(env: &Env, merchant: &Address) {
 
     let size = get_whitelist_size(env);
     if size > 0 {
-        for i in 0..size {
-            let key = DataKey::WhitelistIndex(i);
-            if let Some(addr) = env.storage().persistent().get::<_, Address>(&key) {
-                if addr == *merchant {
-                    let last_idx = size - 1;
-                    if i != last_idx {
-                        let last_key = DataKey::WhitelistIndex(last_idx);
-                        if let Some(last_addr) =
-                            env.storage().persistent().get::<_, Address>(&last_key)
-                        {
-                            env.storage().persistent().set(&key, &last_addr);
-                            env.storage()
-                                .persistent()
-                                .extend_ttl(&key, 1555200, 1555200);
+        // O(1) lookup via reverse index; fall back to full scan only for
+        // entries written before the WhitelistIndexSlot variant existed.
+        let slot_key = DataKey::WhitelistIndexSlot(merchant.clone());
+        let maybe_slot: Option<u32> = env.storage().persistent().get(&slot_key);
+        if let Some(i) = maybe_slot {
+            let last_idx = size - 1;
+            if i != last_idx {
+                // Swap the last entry into the vacated slot.
+                let last_key = DataKey::WhitelistIndex(last_idx);
+                if let Some(last_addr) =
+                    env.storage().persistent().get::<_, Address>(&last_key)
+                {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::WhitelistIndex(i), &last_addr);
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&DataKey::WhitelistIndex(i), 1555200, 1555200);
+                    // Update the reverse index for the moved merchant.
+                    let moved_slot_key = DataKey::WhitelistIndexSlot(last_addr);
+                    env.storage().persistent().set(&moved_slot_key, &i);
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&moved_slot_key, 1555200, 1555200);
+                }
+            }
+            env.storage()
+                .persistent()
+                .remove(&DataKey::WhitelistIndex(last_idx));
+            env.storage().persistent().remove(&slot_key);
+            let size_key = DataKey::WhitelistIndexSize;
+            env.storage().persistent().set(&size_key, &(size - 1));
+            env.storage()
+                .persistent()
+                .extend_ttl(&size_key, 1555200, 1555200);
+        } else {
+            // Legacy path: no reverse index entry — fall back to linear scan.
+            for i in 0..size {
+                let key = DataKey::WhitelistIndex(i);
+                if let Some(addr) = env.storage().persistent().get::<_, Address>(&key) {
+                    if addr == *merchant {
+                        let last_idx = size - 1;
+                        if i != last_idx {
+                            let last_key = DataKey::WhitelistIndex(last_idx);
+                            if let Some(last_addr) =
+                                env.storage().persistent().get::<_, Address>(&last_key)
+                            {
+                                env.storage().persistent().set(&key, &last_addr);
+                                env.storage()
+                                    .persistent()
+                                    .extend_ttl(&key, 1555200, 1555200);
+                                // Also write the reverse index for the moved entry.
+                                let moved_slot_key =
+                                    DataKey::WhitelistIndexSlot(last_addr);
+                                env.storage().persistent().set(&moved_slot_key, &i);
+                                env.storage().persistent().extend_ttl(
+                                    &moved_slot_key,
+                                    1555200,
+                                    1555200,
+                                );
+                            }
                         }
+                        env.storage()
+                            .persistent()
+                            .remove(&DataKey::WhitelistIndex(last_idx));
+                        let size_key = DataKey::WhitelistIndexSize;
+                        env.storage().persistent().set(&size_key, &(size - 1));
+                        env.storage()
+                            .persistent()
+                            .extend_ttl(&size_key, 1555200, 1555200);
+                        break;
                     }
-                    env.storage()
-                        .persistent()
-                        .remove(&DataKey::WhitelistIndex(last_idx));
-                    let size_key = DataKey::WhitelistIndexSize;
-                    env.storage().persistent().set(&size_key, &(size - 1));
-                    env.storage()
-                        .persistent()
-                        .extend_ttl(&size_key, 1555200, 1555200);
-                    break;
                 }
             }
         }
     }
+
+    merchant_stats::unindex_merchant(env, merchant);
 
     events::publish_merchant_removed(env, merchant);
     crate::fee::clear_merchant_fee_recipient(env, merchant);
@@ -196,6 +249,14 @@ pub fn is_frozen(env: &Env, merchant: &Address) -> bool {
 /// If the merchant is already frozen, this is a no-op: no storage is
 /// written and no event is emitted. This prevents event spam when
 /// keepers or admin scripts retry freeze calls.
+///
+/// # TTL (Issue #821)
+///
+/// Both `MerchantFrozen` and `MerchantFreezeReason` are extended to the same
+/// 1 555 200-ledger window used by `add_merchant` for whitelist entries (~90
+/// days at 5 s/ledger). Without this extension the keys archive at the SDK
+/// default live-until, which silently allows a banned merchant to subscribe
+/// again without any operator action — a security-relevant state lapse.
 pub fn freeze(env: &Env, merchant: &Address, reason: Option<soroban_sdk::String>) {
     if is_frozen(env, merchant) {
         return;
@@ -203,16 +264,21 @@ pub fn freeze(env: &Env, merchant: &Address, reason: Option<soroban_sdk::String>
 
     if let Some(r) = &reason {
         if r.len() > 128 {
-            env.panic_with_error(crate::errors::ContractError::MetadataLabelTooLong);
+            env.panic_with_error(crate::errors::ContractError::FreezeReasonTooLong);
         }
+        let reason_key = DataKey::MerchantFreezeReason(merchant.clone());
+        env.storage().persistent().set(&reason_key, r);
         env.storage()
             .persistent()
-            .set(&DataKey::MerchantFreezeReason(merchant.clone()), r);
+            .extend_ttl(&reason_key, 1555200, 1555200);
     }
 
+    let frozen_key = DataKey::MerchantFrozen(merchant.clone());
+    env.storage().persistent().set(&frozen_key, &true);
     env.storage()
         .persistent()
-        .set(&DataKey::MerchantFrozen(merchant.clone()), &true);
+        .extend_ttl(&frozen_key, 1555200, 1555200);
+
     merchant_stats::index_merchant(env, merchant);
     events::publish_merchant_frozen(env, merchant);
     crate::fee::clear_merchant_fee_recipient(env, merchant);
@@ -222,4 +288,25 @@ pub fn freeze(env: &Env, merchant: &Address, reason: Option<soroban_sdk::String>
 ///
 /// # Idempotency (Issue #820)
 ///
-/// If the merchant is n
+/// If the merchant is not currently frozen, this is a no-op: no storage is
+/// modified and no event is emitted. This prevents event spam when
+/// keepers or admin scripts retry unfreeze calls.
+pub fn unfreeze(env: &Env, merchant: &Address) {
+    if !is_frozen(env, merchant) {
+        return;
+    }
+
+    env.storage()
+        .persistent()
+        .remove(&DataKey::MerchantFrozen(merchant.clone()));
+    env.storage()
+        .persistent()
+        .remove(&DataKey::MerchantFreezeReason(merchant.clone()));
+    events::publish_merchant_unfrozen(env, merchant);
+}
+
+pub fn get_freeze_reason(env: &Env, merchant: &Address) -> Option<soroban_sdk::String> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::MerchantFreezeReason(merchant.clone()))
+}

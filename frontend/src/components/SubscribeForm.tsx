@@ -8,7 +8,7 @@ import {
   type FormFields,
 } from "../hooks/useFormValidation";
 import { isValidStellarAddress } from "../utils/addressValidation";
-import { BILLING_INTERVALS, CONTRACT_LIMITS } from "../constants";
+import { BILLING_INTERVALS, CONTRACT_LIMITS, STROOPS_PER_XLM } from "../constants";
 import IntervalSelector from "./IntervalSelector";
 import BalanceDisplay from "./BalanceDisplay";
 import AllowanceDisplay from "./AllowanceDisplay";
@@ -16,6 +16,7 @@ import AddressBook from "./AddressBook";
 import ReferralPanel from "./ReferralPanel";
 import ToastContainer from "./Toast";
 import { useToast } from "../hooks/useToast";
+import { friendlyError } from "../utils/errors";
 import { useDirtyPreroute } from "../hooks/useDirtyPreroute";
 import StroopInput from "./StroopInput";
 
@@ -95,7 +96,7 @@ export default function SubscribeForm({
   const { toasts, addToast, removeToast, pauseToast, resumeToast } = useToast();
 
   const amountString =
-    amountStroops !== null ? (Number(amountStroops) / 10_000_000).toString() : "";
+    amountStroops !== null ? (Number(amountStroops) / STROOPS_PER_XLM).toString() : "";
   const fields: FormFields = { merchant, amount: amountString, interval, tokenAddress };
   const referrerValidation = validateReferrer(referrer, userKey);
   const canSubmit =
@@ -189,7 +190,7 @@ export default function SubscribeForm({
       announce?.("Transaction confirmed");
       onSuccess();
     } catch (err: unknown) {
-      const msg = `Error: ${err instanceof Error ? err.message : String(err)}`;
+      const msg = `Error: ${friendlyError(err instanceof Error ? err.message : String(err))}`;
       setStatus(msg);
       addToast(msg, "error");
       announce?.(msg);
@@ -345,7 +346,7 @@ export default function SubscribeForm({
         <AllowanceDisplay userKey={userKey} subscriptionAmount={0n} refreshTrigger={0} />
         <AllowanceDisplay
           userKey={userKey}
-          subscriptionAmount={BigInt(Math.round(parseFloat(amountString || "0") * 10_000_000))}
+          subscriptionAmount={BigInt(Math.round(parseFloat(amountString || "0") * STROOPS_PER_XLM))}
           refreshTrigger={0}
           tokenId={tokenAddress}
         />
