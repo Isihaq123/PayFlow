@@ -4,6 +4,10 @@
 //! limit from this module so the operator-facing guarantees stay consistent
 //! and cannot drift between entrypoints (e.g. estimate vs. live charge).
 
+use soroban_sdk::Env;
+
+use crate::DataKey;
+
 /// Default cap for the admin batch charge/cancel/pause entrypoints.
 pub const DEFAULT_BATCH_SIZE: u32 = 50;
 
@@ -25,6 +29,15 @@ pub const REVENUE_DAY_PAGE_SIZE: u32 = 30;
 
 /// Page size for the top-merchants ranking query.
 pub const TOP_MERCHANTS_PAGE_SIZE: u32 = 20;
+
+/// Reads the configured live-charge batch cap (`MaxBatchSize`) and clamps it.
+///
+/// This is the cap `batch_charge` enforces. It is separate from the hardcoded
+/// 200-address cap inside `get_batch_charge_estimate`; see
+/// `docs/architecture/batch-estimate-vs-live.md`.
+pub fn get_max_batch_size(env: &Env) -> u32 {
+    effective_batch_size(env.storage().instance().get(&DataKey::MaxBatchSize))
+}
 
 /// Clamp a configured batch limit to the shared hard ceiling.
 ///

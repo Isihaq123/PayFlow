@@ -13,6 +13,7 @@ extern crate std;
 
 mod admin;
 mod batch;
+mod caps;
 #[cfg(feature = "bench")]
 mod bench;
 mod charge_exec;
@@ -24,6 +25,8 @@ mod merchant_stats;
 mod migration;
 mod min_interval;
 mod referral;
+#[cfg(test)]
+mod scenario;
 mod spending_limit;
 mod storage;
 mod subscription_count;
@@ -970,7 +973,7 @@ impl FlowPay {
     ///
     /// Requires authorization from the pending (new) admin.
     pub fn accept_admin(env: Env) {
-        admin::accept_admin(&env);
+        admin::accept_admin(&env).unwrap_or_else(|err| env.panic_with_error(err));
     }
 
     /// Returns the proposed admin address awaiting `accept_admin()`, or

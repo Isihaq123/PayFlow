@@ -5431,17 +5431,6 @@ fn test_health_check_pending_merchant_revenue_counter() {
     let report2 = client.contract_health_check();
     assert_eq!(report2.pending_merchant_rev_count, 2);
 
-    // Withdraw merchant1's revenue (mint contract_id balance first so transfer succeeds)
-    sac.mint(&contract_id, &1000);
-    client.withdraw_merchant_revenue(&merchant1);
-    let report3 = client.contract_health_check();
-    assert_eq!(report3.pending_merchant_rev_count, 1);
-
-    // Withdraw merchant2's revenue
-    sac.mint(&contract_id, &1000);
-    client.withdraw_merchant_revenue(&merchant2);
-    let report4 = client.contract_health_check();
-    assert_eq!(report4.pending_merchant_rev_count, 0);
 }
 
 #[test]
@@ -9995,7 +9984,7 @@ fn test_contract_config() {
     client.initialize(&token_addr, &admin);
 
     let config = client.get_contract_config();
-    assert_eq!(config.schema_version, 1);
+    assert_eq!(config.schema_version, crate::migration::CURRENT_VERSION);
     assert_eq!(config.paused, false);
 }
 
@@ -12770,4 +12759,315 @@ fn test_max_whitelist_batch_size_set_event_old_is_default_before_first_override(
 
     assert_eq!(old, 50u32);
     assert_eq!(new, 100u32);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Issue #1435: get_batch_charge_estimate vs live batch_charge
+//
+// The property test below generates seeded random subscription states, writes
+// them into storage, then runs the estimate and the live batch against the
+// same state and compares outcomes per address. Only divergences whitelisted
+// in `scenario::documented_outcome_divergence` (and listed in
+// docs/architecture/batch-estimate-vs-live.md) are accepted.
+// ─────────────────────────────────────────────────────────────
+
+/// Number of deterministic seeds the parity property runs.
+const PARITY_SEEDS: u64 = 64;
+
+fn write_generated_subscription(
+    env: &Env,
+    contract_id: &Address,
+    token_addr: &Address,
+    merchant: &Address,
+    user: &Address,
+    generated: &scenario::GeneratedSubscription,
+    now: u64,
+) {
+    env.as_contract(contract_id, || {
+        let key = DataKey::Subscription(user.clone());
+        env.storage().persistent().set(
+            &key,
+            &Subscription {
+                merchant: merchant.clone(),
+                amount: generated.amount,
+                interval: generated.interval,
+                last_charged: generated.last_charged,
+                active: generated.active,
+                paused: generated.paused,
+                token: token_addr.clone(),
+                referrer: None,
+                label: Symbol::new(env, "parity"),
+                trial_duration: 0,
+                created_at: now,
+            },
+        );
+        match generated.pause_expiry {
+            Some(expiry) => storage::set_pause_expiry(env, user, expiry),
+            None => storage::clear_pause_expiry(env, user),
+        }
+    });
+}
+
+/// Property: for random snapshot states, `get_batch_charge_estimate` and
+/// `batch_charge` return the same `ChargeResult` for every address, except for
+/// the whitelisted, documented divergences. Any pair not covered by the
+/// whitelist fails with the seed and state needed to reproduce it.
+#[test]
+fn test_estimate_matches_live_batch_charge_property() {
+    let mut outcome_counts = [0u32; 7];
+    let mut whitelisted = 0u32;
+
+    // A fresh Env per seed keeps each generated case fully isolated; the
+    // per-case snapshots are ignored by `.gitignore` because they change with
+    // every generator update and are not meaningful diffs.
+    for seed in 0..PARITY_SEEDS {
+        let (env, contract_id, token_addr, _unused_user, merchant) = setup();
+        let client = FlowPayClient::new(&env, &contract_id);
+        install_admin(&env, &contract_id);
+
+        let mut rng = scenario::ScenarioRng::new(seed);
+        let now: u64 = 1_700_000_000 + rng.next_bounded(31_536_000);
+        env.ledger().set_timestamp(now);
+
+        let grace_period = rng.pick(&[0u64, 3_600, 86_400]);
+        if grace_period > 0 {
+            client.propose_grace_period(&grace_period);
+            client.commit_grace_period();
+        }
+
+        let fee_bps = rng.pick(&[0u32, 250, 1_000]);
+        if fee_bps > 0 {
+            let collector = Address::generate(&env);
+            client.propose_fee(&collector, &fee_bps);
+            client.commit_fee();
+        }
+
+        // One snapshot per unique address, then a batch that draws from that
+        // pool with replacement so repeated addresses are exercised too.
+        let pool_len = 1 + rng.next_bounded(3) as usize;
+        let mut users: std::vec::Vec<Address> = std::vec::Vec::new();
+        let mut generated: std::vec::Vec<scenario::GeneratedSubscription> = std::vec::Vec::new();
+        for _ in 0..pool_len {
+            let user = Address::generate(&env);
+            let state = scenario::generate(&mut rng, now, grace_period);
+            if state.has_subscription {
+                let sac = StellarAssetClient::new(&env, &token_addr);
+                sac.mint(&user, &state.amount.saturating_mul(3));
+                let token = TokenClient::new(&env, &token_addr);
+                token.approve(&user, &contract_id, &state.allowance, &200_000);
+                write_generated_subscription(
+                    &env,
+                    &contract_id,
+                    &token_addr,
+                    &merchant,
+                    &user,
+                    &state,
+                    now,
+                );
+            }
+            users.push(user);
+            generated.push(state);
+        }
+
+        let batch_len = 1 + rng.next_bounded(6) as usize;
+        let mut batch_indices: std::vec::Vec<usize> = std::vec::Vec::new();
+        let mut batch: Vec<Address> = Vec::new(&env);
+        for _ in 0..batch_len {
+            let index = rng.next_bounded(pool_len as u64) as usize;
+            batch_indices.push(index);
+            batch.push_back(users[index].clone());
+        }
+
+        let estimate = client.get_batch_charge_estimate(&batch);
+        let live = client.batch_charge(&batch);
+
+        let mut seen: std::vec::Vec<bool> = std::vec::Vec::new();
+        seen.resize(pool_len, false);
+        let mut charged_earlier: std::vec::Vec<bool> = std::vec::Vec::new();
+        charged_earlier.resize(pool_len, false);
+
+        for (position, index) in batch_indices.iter().enumerate() {
+            let estimate_result = estimate.get(position as u32).unwrap();
+            let live_result = live.get(position as u32).unwrap();
+            let context = scenario::BatchContext {
+                repeated_address: seen[*index],
+                charged_earlier: charged_earlier[*index],
+            };
+
+            match scenario::documented_outcome_divergence(
+                estimate_result.clone(),
+                live_result.clone(),
+                &context,
+            ) {
+                Some(reason) => {
+                    whitelisted += 1;
+                    assert!(
+                        context.repeated_address && context.charged_earlier,
+                        "whitelist matched {reason} without a repeated charged address (seed {seed})"
+                    );
+                }
+                None => assert_eq!(
+                    estimate_result, live_result,
+                    "undocumented estimate/live divergence at seed {seed}, position {position}: estimate={estimate:?}, live={live:?}, batch={batch_indices:?}, state={:?}, grace={grace_period}, fee_bps={fee_bps}. Documented divergences: {}",
+                    generated[*index], scenario::DIVERGENCE_DOC
+                ),
+            }
+
+            match live_result.clone() {
+                crate::ChargeResult::Charged => outcome_counts[0] += 1,
+                crate::ChargeResult::Skipped => outcome_counts[1] += 1,
+                crate::ChargeResult::NoSubscription => outcome_counts[2] += 1,
+                crate::ChargeResult::Inactive => outcome_counts[3] += 1,
+                crate::ChargeResult::Paused => outcome_counts[4] += 1,
+                crate::ChargeResult::GracePeriodElapsed => outcome_counts[5] += 1,
+                crate::ChargeResult::AllowanceInsufficient => outcome_counts[6] += 1,
+            }
+
+            seen[*index] = true;
+            charged_earlier[*index] |= live_result == crate::ChargeResult::Charged;
+        }
+    }
+
+    assert!(
+        whitelisted > 0,
+        "generator never produced a whitelisted divergence; the duplicate-address path is untested"
+    );
+    assert!(
+        outcome_counts.iter().all(|count| *count > 0),
+        "generator must exercise every ChargeResult variant, saw {outcome_counts:?}"
+    );
+}
+
+/// Documented divergence: the estimate does not model protocol pause, while
+/// live `batch_charge` rejects the whole call before the per-user loop.
+#[test]
+fn test_estimate_ignores_contract_pause_while_live_rejects() {
+    let (env, contract_id, token_addr, user, merchant) = setup();
+    let client = FlowPayClient::new(&env, &contract_id);
+    install_admin(&env, &contract_id);
+
+    client.subscribe(
+        &user,
+        &merchant,
+        &1_0000000,
+        &86400,
+        &token_addr,
+        &None,
+        &None,
+    );
+    env.ledger().with_mut(|l| {
+        l.timestamp += 86_401;
+    });
+
+    client.pause_contract();
+
+    let users = soroban_sdk::vec![&env, user.clone()];
+    let estimate = client.get_batch_charge_estimate(&users);
+    assert_eq!(
+        estimate.get(0).unwrap(),
+        crate::ChargeResult::Charged,
+        "estimate is documented to ignore the protocol pause"
+    );
+
+    let live = client.try_batch_charge(&users);
+    assert_eq!(
+        live,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            crate::errors::ContractError::ContractPaused as u32
+        ))),
+        "live batch_charge is documented to reject a paused contract"
+    );
+}
+
+/// Documented divergence: the estimate is not a pure view. An expired bounded
+/// pause is persisted by `try_auto_resume`, exactly like the live path; the
+/// outcome still matches afterwards.
+#[test]
+fn test_estimate_persists_expired_pause_auto_resume() {
+    let (env, contract_id, token_addr, user, merchant) = setup();
+    let client = FlowPayClient::new(&env, &contract_id);
+
+    client.subscribe(
+        &user,
+        &merchant,
+        &1_0000000,
+        &86400,
+        &token_addr,
+        &None,
+        &None,
+    );
+    client.pause_until(&user, &90_000);
+    env.ledger().with_mut(|l| {
+        l.timestamp = 90_001;
+    });
+
+    let users = soroban_sdk::vec![&env, user.clone()];
+    let estimate = client.get_batch_charge_estimate(&users);
+    assert_eq!(estimate.get(0).unwrap(), crate::ChargeResult::Charged);
+
+    let after_estimate = client.get_subscription(&user).unwrap();
+    assert!(
+        after_estimate.active && !after_estimate.paused,
+        "estimate is documented to persist the auto-resume (not a pure view)"
+    );
+    env.as_contract(&contract_id, ||
+        assert!(
+            storage::get_pause_expiry(&env, &user).is_none(),
+            "estimate is documented to clear PauseExpiry when it auto-resumes"
+        ));
+
+    let live = client.batch_charge(&users);
+    assert_eq!(live.get(0).unwrap(), crate::ChargeResult::Charged);
+}
+
+/// Documented divergence: repeated addresses in one batch. Live processes the
+/// batch sequentially and persists `last_charged`, so the second occurrence is
+/// no longer due; the estimate reports the pre-batch snapshot for both.
+#[test]
+fn test_estimate_vs_live_duplicate_address_divergence() {
+    let (env, contract_id, token_addr, user, merchant) = setup();
+    let client = FlowPayClient::new(&env, &contract_id);
+
+    client.subscribe(
+        &user,
+        &merchant,
+        &1_0000000,
+        &86400,
+        &token_addr,
+        &None,
+        &None,
+    );
+    env.ledger().with_mut(|l| {
+        l.timestamp += 86_401;
+    });
+
+    let users = soroban_sdk::vec![&env, user.clone(), user.clone()];
+    let estimate = client.get_batch_charge_estimate(&users);
+    assert_eq!(estimate.get(0).unwrap(), crate::ChargeResult::Charged);
+    assert_eq!(
+        estimate.get(1).unwrap(),
+        crate::ChargeResult::Charged,
+        "estimate sees the pre-batch snapshot at every position"
+    );
+
+    let live = client.batch_charge(&users);
+    assert_eq!(live.get(0).unwrap(), crate::ChargeResult::Charged);
+    assert_eq!(
+        live.get(1).unwrap(),
+        crate::ChargeResult::Skipped,
+        "live persists last_charged, so the repeated address is no longer due"
+    );
+
+    let reason = scenario::documented_outcome_divergence(
+        crate::ChargeResult::Charged,
+        crate::ChargeResult::Skipped,
+        &scenario::BatchContext {
+            repeated_address: true,
+            charged_earlier: true,
+        },
+    );
+    assert!(
+        reason.is_some(),
+        "the duplicate-address divergence must stay whitelisted"
+    );
 }

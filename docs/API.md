@@ -1471,6 +1471,10 @@ get_batch_charge_estimate(env: Env, users: Vec<Address>) -> Vec<ChargeResult>
 2. Does **not** check protocol pause (`is_contract_paused`). `simulate_charge` returns `ContractPaused` instead.
 3. Allowance **is** checked (same gross-amount test as live `batch_charge`). A keeper file-header comment that says otherwise is stale.
 4. Cap 200 vs live batch max (default 50 via `MaxBatchSize`).
+5. A repeated address is reported as `Charged` at every position, while live charges the first occurrence and returns `Skipped` for later ones. De-duplicate batches.
+6. Transfer-time failures (subscriber balance, hourly global volume cap, SAC errors) abort live `batch_charge` but are not modelled; preflight them before acting on an estimate.
+
+Fees do not change outcomes: allowance is checked against gross and `fee + net == gross`. They only change balances, which the estimate leaves untouched. The full list of tolerated differences, and the randomized property test that enforces it, is in [`architecture/batch-estimate-vs-live.md`](./architecture/batch-estimate-vs-live.md).
 
 Use `simulate_charge` when you need a no-write, pause-aware single-user dry-run. Keepers that charge should still call `batch_charge` ([`KEEPER.md`](./KEEPER.md)). Auto-resume event: [`EVENTS.md`](./EVENTS.md).
 

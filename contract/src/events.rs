@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, BytesN, Env, Symbol};
+use soroban_sdk::{Address, BytesN, Env, String, Symbol};
 
 use crate::Subscription;
 
@@ -120,7 +120,7 @@ pub fn publish_admin_transfer_proposed(env: &Env, new_admin: &Address) {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetadataSetEventData {
     pub user: Address,
-    pub label: BytesN<64>,
+    pub label: String,
     pub ledger_sequence: u32,
 }
 
@@ -134,7 +134,7 @@ pub struct MetadataClearedEventData {
 }
 
 /// Publishes `metadata_set(user)` with the written label.
-pub fn publish_metadata_set(env: &Env, user: &Address, label: &BytesN<64>) {
+pub fn publish_metadata_set(env: &Env, user: &Address, label: &String) {
     env.events().publish(
         (Symbol::new(env, "metadata_set"), user.clone()),
         MetadataSetEventData {
@@ -262,6 +262,36 @@ pub fn publish_batch_charge_skips(env: &Env, data: BatchChargeSkipsEventData) {
     env.events().publish(
         (Symbol::new(env, "batch_charge_skips"),),
         data,
+    );
+}
+
+pub fn publish_pay_per_use(env: &Env, user: &Address, merchant: &Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "pay_per_use"), user.clone()),
+        PayPerUseEventData {
+            merchant: merchant.clone(),
+            amount,
+            ledger_sequence: env.ledger().sequence(),
+        },
+    );
+}
+
+pub fn publish_cancelled(env: &Env, user: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "cancelled"), user.clone()),
+        CancelledEventData {
+            ledger_sequence: env.ledger().sequence(),
+        },
+    );
+}
+
+pub fn publish_cancelled_with_refund(env: &Env, user: &Address, refund_amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "cancelled_with_refund"), user.clone()),
+        CancelledWithRefundEventData {
+            refund_amount,
+            ledger_sequence: env.ledger().sequence(),
+        },
     );
 }
 

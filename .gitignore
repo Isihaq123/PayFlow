@@ -198,3 +198,8 @@ contract/target/
 
 # Webhook Dead Letter Queue
 data/webhook-dlq.jsonl
+
+# Soroban writes one test snapshot per `Env`; the seeded estimate-vs-live
+# property test creates one per generated case, so these change on every
+# generator update and are not meaningful review diffs.
+contract/test_snapshots/test/test_estimate_matches_live_batch_charge_property.*.json

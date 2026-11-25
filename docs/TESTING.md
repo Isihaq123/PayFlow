@@ -167,6 +167,15 @@ env.ledger().with_mut(|l| {
 });
 ```
 
+### Estimate vs live batch parity
+
+`test_estimate_matches_live_batch_charge_property` generates 64 seeded batches in `contract/src/scenario.rs`, writes each snapshot into storage, and compares `get_batch_charge_estimate` against live `batch_charge` address by address. Only differences whitelisted in `scenario::documented_outcome_divergence` are accepted; the documented list is in [`architecture/batch-estimate-vs-live.md`](./architecture/batch-estimate-vs-live.md). A failure prints the seed, batch layout and state needed to reproduce it.
+
+```bash
+cd contract
+cargo test test_estimate_matches_live_batch_charge_property -- --nocapture
+```
+
 ---
 
 ## Frontend Tests
